@@ -37,22 +37,30 @@ class PhotoSearcher: ObservableObject {
     let photoCollection = PhotoCollection(smartAlbum: .smartAlbumUserLibrary)
     var photoSearchModel = PhotoSearcherModel()
     let EMBEDDING_DATA_NAME = "embeddingData"
+    let OPTIMIZED_EMBEDDING_DATA_NAME = "embeddingDataV2"
     let KEY_HAS_ACCESS_TO_PHOTOS = "KEY_HAS_ACCESS_TO_PHOTOS"
-    
+
     // -3: default, -2: Is searching now, -1: Never indexed. 0: No result. 1: Has result.
     @Published var searchResultCode: SEARCH_RESULT_CODE = .DEFAULT
     @Published var buildIndexCode: BUILD_INDEX_CODE = .DEFAULT
     @Published var totalUnIndexedPhotosNum: Int = -1
     @Published var curIndexingNums: Int = -1
     @Published var curShowingPhoto: UIImage = UIImage(systemName: "photo")!
-    
+
     @Published var isFindingSimilarPhotos = false
     @Published var similarPhotoAssets = [PhotoAsset]()
     @Published var searchResultPhotoAssets = [PhotoAsset]()
     @Published var searchString: String = ""
-    
+
+    // Legacy storage (kept for migration compatibility)
     private(set) var savedEmbedding = [String: MLMultiArray]()
     private(set) var buildingEmbedding = [String: MLMultiArray]()
+
+    // Optimized storage - contiguous memory with pre-normalized embeddings
+    private(set) var embeddingStore = EmbeddingStore()
+    private let similarityComputer = SimilarityComputer()
+    private var useOptimizedSearch = false
+
     private var curIndexingPhoto: UIImage = UIImage(systemName: "photo")!
     private var imageRequestID: PHImageRequestID?
     private var allPhotosId = [String: Int]()
@@ -87,21 +95,28 @@ class PhotoSearcher: ObservableObject {
         print("Clear cache..")
         clearCache()
         print("Cache cleared.")
-        
+
         self.searchResultCode = .DEFAULT
         print("Loading text encoder..")
         self.photoSearchModel.load_text_encoder()
         print("Text encoder loaded.")
-        if self.loadEmbeddingsData(fileName: self.EMBEDDING_DATA_NAME) {
-            print("Photos embedding loaded. total \(self.savedEmbedding.count)")
+
+        // Try to load optimized embeddings first, then fall back to legacy
+        if self.loadOptimizedEmbeddings() {
+            print("Optimized embeddings loaded. total \(self.embeddingStore.count)")
+            self.useOptimizedSearch = true
+        } else if self.loadEmbeddingsData(fileName: self.EMBEDDING_DATA_NAME) {
+            print("Legacy embeddings loaded. total \(self.savedEmbedding.count)")
+            // Migrate to optimized format in background
+            self.migrateToOptimizedFormat()
         } else {
             self.searchResultCode = .NEVER_INDEXED
             print("Load photos embedding failure.")
         }
-        
+
         // set network authorization
         await self.photoCollection.cache.requestOptions.isNetworkAccessAllowed = false
-        
+
         // Get the current authorization state.
         let status = PHPhotoLibrary.authorizationStatus()
         if (status == .authorized) {
@@ -109,9 +124,53 @@ class PhotoSearcher: ObservableObject {
             defaults.set(true, forKey: self.KEY_HAS_ACCESS_TO_PHOTOS)
             print("KEY_HAS_ACCESS_TO_PHOTOS has been updated to true.")
         }
-        
-        if !self.savedEmbedding.isEmpty {
+
+        if !self.savedEmbedding.isEmpty || !self.embeddingStore.isEmpty {
             self.searchResultCode = .MODEL_PREPARED
+        }
+    }
+
+    /// Load optimized embedding format
+    private func loadOptimizedEmbeddings() -> Bool {
+        let filePath = self.getDocumentsDirectory().appendingPathComponent(self.OPTIMIZED_EMBEDDING_DATA_NAME)
+
+        do {
+            let startingTime = Date()
+            self.embeddingStore = try EmbeddingStore.load(from: filePath)
+            print("\(startingTime.timeIntervalSinceNow * -1) seconds used for loading optimized embeddingData")
+            return true
+        } catch {
+            print("Optimized embeddings not found or failed to load: \(error)")
+            return false
+        }
+    }
+
+    /// Migrate legacy embeddings to optimized format
+    private func migrateToOptimizedFormat() {
+        print("Migrating to optimized embedding format...")
+        let startingTime = Date()
+
+        self.embeddingStore = EmbeddingStore.migrate(from: self.savedEmbedding)
+        self.useOptimizedSearch = true
+
+        // Save optimized format
+        let filePath = self.getDocumentsDirectory().appendingPathComponent(self.OPTIMIZED_EMBEDDING_DATA_NAME)
+        do {
+            try self.embeddingStore.save(to: filePath)
+            print("Migration complete in \(startingTime.timeIntervalSinceNow * -1) seconds. Saved \(self.embeddingStore.count) embeddings.")
+        } catch {
+            print("Failed to save optimized embeddings: \(error)")
+        }
+    }
+
+    /// Save optimized embeddings to disk
+    private func saveOptimizedEmbeddings() {
+        let filePath = self.getDocumentsDirectory().appendingPathComponent(self.OPTIMIZED_EMBEDDING_DATA_NAME)
+        do {
+            try self.embeddingStore.save(to: filePath)
+            print("Optimized embeddings saved: \(self.embeddingStore.count) embeddings")
+        } catch {
+            print("Failed to save optimized embeddings: \(error)")
         }
     }
     
@@ -270,55 +329,76 @@ class PhotoSearcher: ObservableObject {
     func fetchUnIndexedPhotos() async throws {
         self.unIndexedPhotos = [PhotoAsset]()
         let startingTime = Date()
-        
+
         for idx in 0..<self.photoCollection.photoAssets.count {
             let _cur_asset = self.photoCollection.photoAssets[idx]
-            
+
             self.allPhotosId[_cur_asset.id] = 1
-            if self.savedEmbedding[_cur_asset.id] == nil {
+
+            // Check both legacy and optimized stores
+            let isIndexed = self.savedEmbedding[_cur_asset.id] != nil ||
+                           self.embeddingStore.contains(id: _cur_asset.id)
+
+            if !isIndexed {
                 self.unIndexedPhotos.append(_cur_asset)
             }
         }
-        
+
         print("\(startingTime.timeIntervalSinceNow * -1) seconds used for filter unindex photos")
-        
+
         self.totalUnIndexedPhotosNum = self.unIndexedPhotos.count
     }
-    
+
     private func judgeIfAssetUnidexed(asset: PhotoAsset) async {
-        if self.savedEmbedding[asset.id] == nil {
+        let isIndexed = self.savedEmbedding[asset.id] != nil ||
+                       self.embeddingStore.contains(id: asset.id)
+        if !isIndexed {
             self.unIndexedPhotos.append(asset)
         }
     }
-    
+
     func deleteEmbeddingByAsset(asset: PhotoAsset) async {
+        // Delete from legacy store
         if self.savedEmbedding[asset.id] != nil {
             self.savedEmbedding.removeValue(forKey: asset.id)
-            print("\(asset.id) deleted.")
+            print("\(asset.id) deleted from legacy store.")
+        }
+        // Delete from optimized store
+        if self.embeddingStore.remove(id: asset.id) {
+            self.saveOptimizedEmbeddings()
+            print("\(asset.id) deleted from optimized store.")
         }
     }
-    
+
     func updateEmbedding(new_indexed_results: [String: MLMultiArray]) {
-        // update results
+        // update legacy results
         print("Before update, embedding count=\(self.savedEmbedding.count)")
         for (key, embedding) in new_indexed_results {
             self.savedEmbedding[key] = embedding
         }
-        
+
         var final_all_results = [Embedding]()
-        
+
         for (key, embedding) in self.savedEmbedding {
             let _embedding = Embedding(id: key, embedding: embedding)
             final_all_results.append(_embedding)
         }
-        
+
         print("After update, embedding count=\(self.savedEmbedding.count)")
         if self.saveEmbeddingsData(embeddings: final_all_results, fileName: self.EMBEDDING_DATA_NAME) {
-            print("Embedding saved")
+            print("Legacy embedding saved")
         } else {
-            print("Embedding not saved")
+            print("Legacy embedding not saved")
         }
-        
+
+        // Also update optimized store
+        for (key, mlArray) in new_indexed_results {
+            let shaped = MLShapedArray<Float32>(converting: mlArray)
+            self.embeddingStore.add(id: key, embedding: shaped.scalars)
+        }
+        self.saveOptimizedEmbeddings()
+        self.useOptimizedSearch = true
+
         final_all_results = [Embedding]()
     }
 
@@ -414,8 +494,16 @@ class PhotoSearcher: ObservableObject {
         // clean before results.
         self.searchString = query
         self.searchResultPhotoAssets = [PhotoAsset]()
-        
+
         self.searchResultCode = .IS_SEARCHING
+
+        // Use optimized search path if available
+        if self.useOptimizedSearch && !self.embeddingStore.isEmpty {
+            await self.searchOptimized(with: query)
+            return
+        }
+
+        // Legacy search path
         do {
             if self.savedEmbedding.isEmpty {
                 print("Never indexed.")
@@ -424,11 +512,11 @@ class PhotoSearcher: ObservableObject {
                 // search from indexed result
                 print("Has indexed data, now begin to search.")
                 print("Test if I can fetch all photos: \(self.photoCollection.photoAssets.count)")
-                
+
                 // Filter whether Photo has been deleted.
                 if !self.allPhotosId.isEmpty {
                     let startingTime = Date()
-                    
+
                     var cnt = 0
                     for key in self.savedEmbedding.keys {
                         if let _ = self.allPhotosId[key] {
@@ -438,54 +526,103 @@ class PhotoSearcher: ObservableObject {
                         }
                     }
                     print("\(cnt) keys in savedEmbedding has been deleted.")
-                    
+
                     if cnt > 0 {
                         self.updateEmbedding(new_indexed_results: [String : MLMultiArray]())
                     }
                     print("\(startingTime.timeIntervalSinceNow * -1) seconds used for save the updated embedding to file.")
                 }
-                
+
                 print("Searching query = \(query)")
                 let _text_emb = self.photoSearchModel.text_embedding(prompt: query)
                 print(_text_emb)
-                
+
                 let startingTime = Date()
-    
-                
+
+
                 let img_emb_pieces_lst = self.seperateEmbeddingsByCoreNums(img_embs_dict: self.savedEmbedding)
-                
+
                 // 6.69201397895813 seconds used for calculat sim between 34639 embs before.
                 // self.simpleComputeAllEmbeddingSim(text_emb: _text_emb, img_emb_pieces_lst: img_emb_pieces_lst)
-                
+
                 // reduce to 2.8s.
                 try await self.batchComputeEmbeddingSimilarity(text_emb: _text_emb, img_embs_dict_lst: img_emb_pieces_lst)
                 print("\(startingTime.timeIntervalSinceNow * -1) seconds used for calculat sim between \(self.savedEmbedding.keys.count) embs.")
-                
+
                 let startingTime2 = Date()
                 // 0.20966589450836182 seconds used for find top3 sim in 34639 scores.
-                
+
                 let FINAL_TOP_K = min(self.TOPK_SIM, self.emb_sim_dict.count)
                 let topK_sim = self.emb_sim_dict.sorted { $0.value > $1.value }.prefix(FINAL_TOP_K)
                 print("\(startingTime2.timeIntervalSinceNow * -1) seconds used for find top\(FINAL_TOP_K) sim in \(self.emb_sim_dict.keys.count) scores.")
-                
+
                 let startingTime3 = Date()
-                
+
                 for photo in topK_sim {
                     let photoSim = photo.value
                     let photoID = photo.key
                     logger.debug("photoID: \(photoID), sim: \(photoSim)")
-                    
+
                     let _asset = PhotoAsset(identifier: photoID)
                     self.searchResultPhotoAssets.append(_asset)
                 }
                 print("\(startingTime3.timeIntervalSinceNow * -1) seconds used for download top\(FINAL_TOP_K) sim images.")
-                
+
                 self.searchResultCode = .HAS_RESULT
             }
-            
+
         } catch let error {
             logger.error("Failed to search photos: \(error.localizedDescription)")
         }
+    }
+
+    /// Optimized search using pre-normalized embeddings and heap-based top-K
+    private func searchOptimized(with query: String) async {
+        print("Using optimized search path")
+        print("Total photos in library: \(self.photoCollection.photoAssets.count)")
+
+        // Filter deleted photos from embedding store
+        if !self.allPhotosId.isEmpty {
+            let startingTime = Date()
+            let validIds = Set(self.allPhotosId.keys)
+            let removedCount = self.embeddingStore.retainOnly(validIds: validIds)
+
+            if removedCount > 0 {
+                print("\(removedCount) deleted photos removed from embedding store.")
+                self.saveOptimizedEmbeddings()
+            }
+            print("\(startingTime.timeIntervalSinceNow * -1) seconds used for filtering deleted photos.")
+        }
+
+        print("Searching query = \(query)")
+
+        // Encode text query
+        let textEmbedding = self.photoSearchModel.text_embedding(prompt: query)
+        print("Text embedding computed")
+
+        let startingTime = Date()
+
+        // Use optimized similarity search (runs off main actor)
+        let topResults = await Task.detached { [embeddingStore, similarityComputer, TOPK_SIM] in
+            return similarityComputer.findTopK(
+                query: textEmbedding.scalars,
+                in: embeddingStore,
+                k: TOPK_SIM
+            )
+        }.value
+
+        print("\(startingTime.timeIntervalSinceNow * -1) seconds used for optimized similarity search on \(self.embeddingStore.count) embeddings.")
+
+        // Build results
+        let startingTime2 = Date()
+        for result in topResults {
+            logger.debug("photoID: \(result.id), sim: \(result.score)")
+            let asset = PhotoAsset(identifier: result.id)
+            self.searchResultPhotoAssets.append(asset)
+        }
+        print("\(startingTime2.timeIntervalSinceNow * -1) seconds used for creating \(topResults.count) PhotoAsset objects.")
+
+        self.searchResultCode = topResults.isEmpty ? .NO_RESULT : .HAS_RESULT
     }
     
     
@@ -495,6 +632,14 @@ class PhotoSearcher: ObservableObject {
     func similarPhoto(with photoAsset: PhotoAsset) async {
         self.isFindingSimilarPhotos = true
         self.similarPhotoAssets = [PhotoAsset]()
+
+        // Use optimized path if available
+        if self.useOptimizedSearch && !self.embeddingStore.isEmpty {
+            await self.similarPhotoOptimized(with: photoAsset)
+            return
+        }
+
+        // Legacy path
         do {
             let _img_emb = MLShapedArray<Float32>(converting: self.savedEmbedding[photoAsset.id]!)
             print(_img_emb)
@@ -504,31 +649,62 @@ class PhotoSearcher: ObservableObject {
             // reduce to 2.8s.
             try await self.batchComputeEmbeddingSimilarity(text_emb: _img_emb, img_embs_dict_lst: img_emb_pieces_lst)
             print("\(startingTime.timeIntervalSinceNow * -1) seconds used for calculat sim between \(self.savedEmbedding.keys.count) embs.")
-            
+
             let startingTime2 = Date()
             // 0.20966589450836182 seconds used for find top3 sim in 34639 scores.
-            
+
             let FINAL_TOP_K = min(self.TOPK_SIM, self.emb_sim_dict.count)
             let topK_sim = self.emb_sim_dict.sorted { $0.value > $1.value }.prefix(FINAL_TOP_K)
             print("\(startingTime2.timeIntervalSinceNow * -1) seconds used for find top\(FINAL_TOP_K) sim in \(self.emb_sim_dict.keys.count) scores.")
-            
+
             let startingTime3 = Date()
-            
+
             for photo in topK_sim {
                 let photoSim = photo.value
                 let photoID = photo.key
                 print(photoID, photoSim)
-                
+
                 let _asset = PhotoAsset(identifier: photoID)
                 self.similarPhotoAssets.append(_asset)
             }
             print("\(startingTime3.timeIntervalSinceNow * -1) seconds used for download top\(FINAL_TOP_K) sim images.")
-            
+
             self.isFindingSimilarPhotos = false
-            
+
         } catch let error {
             logger.error("Failed to search photos: \(error.localizedDescription)")
         }
+    }
+
+    /// Optimized similar photo search
+    private func similarPhotoOptimized(with photoAsset: PhotoAsset) async {
+        guard let queryEmbedding = self.embeddingStore.embedding(for: photoAsset.id) else {
+            print("Embedding not found for photo: \(photoAsset.id)")
+            self.isFindingSimilarPhotos = false
+            return
+        }
+
+        let startingTime = Date()
+
+        // Use optimized similarity search (runs off main actor)
+        let topResults = await Task.detached { [embeddingStore, similarityComputer, TOPK_SIM] in
+            return similarityComputer.findTopK(
+                query: queryEmbedding,
+                in: embeddingStore,
+                k: TOPK_SIM
+            )
+        }.value
+
+        print("\(startingTime.timeIntervalSinceNow * -1) seconds used for optimized similar photo search on \(self.embeddingStore.count) embeddings.")
+
+        // Build results
+        for result in topResults {
+            print("\(result.id), \(result.score)")
+            let asset = PhotoAsset(identifier: result.id)
+            self.similarPhotoAssets.append(asset)
+        }
+
+        self.isFindingSimilarPhotos = false
     }
     
     private func seperateEmbeddingsByCoreNums(img_embs_dict: [String: MLMultiArray]) -> [[String: MLMultiArray]]{
